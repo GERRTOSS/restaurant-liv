@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  # 1. Redis 容器服务
+  my-redis:
+    image: redis:8.4.0  # 👈 精准对齐你的本地版本
+    container_name: restaurant-redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # 2. RabbitMQ 容器服务
+  my-rabbitmq:
+    image: rabbitmq:3.13.7-management # 👈 精准对齐你的版本，并带有管理控制台
+    container_name: restaurant-mq
+    ports:
+      - "5672:5672"
+      - "15672:15672" # 网页控制台端口
+    restart: always
+
+  # 3. MySQL 容器服务
+  my-mysql:
+    image: mysql:8.0.11  # 👈 精准对齐你的本地版本
+    container_name: restaurant-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456 # 你的数据库密码
+      MYSQL_DATABASE: restaurant  # 自动创建名为 restaurant 的数据库
+    # 💡 数据持久化：把容器内的数据库文件映射到你电脑项目目录下的 mysql_data 文件夹，防止容器关闭后数据丢失
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+    restart: always
+
+  # 4. 你的 Java 后端服务
+  restaurant-app:
+    build: . # 读取当前目录下的 Dockerfile 进行构建
+    container_name: restaurant-backend
+    ports:
+      - "8080:8080"
+    # 确保依赖的中间件全部启动完毕后，再启动 Java 后端
+    depends_on:
+      - my-redis
+      - my-mysql
+      - my-rabbitmq
+    restart: always
