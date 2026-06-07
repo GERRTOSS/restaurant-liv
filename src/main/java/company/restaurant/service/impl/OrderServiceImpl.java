@@ -4,7 +4,6 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import company.restaurant.dto.PageQueryDTO;
 import company.restaurant.mq.KitchenNotifyMessage;
-import company.restaurant.mq.MQProducer;
 import company.restaurant.service.OrderService;
 import company.restaurant.context.UserContext;
 import company.restaurant.dto.CreateOrderDTO;
@@ -42,7 +41,6 @@ public class OrderServiceImpl implements OrderService {
     private final TableMapper tableMapper;
     private final OrderItemMapper orderItemMapper;
     private final DishMapper dishMapper;
-    private final MQProducer mqProducer;//注入MQ，用于通知后厨
     private final StringRedisTemplate stringRedisTemplate;
     private final DefaultRedisScript<Long> stockDeductScript;
     private final ApplicationEventPublisher applicationEventPublisher;
@@ -55,20 +53,20 @@ public class OrderServiceImpl implements OrderService {
      * 3. 计算订单总价、总时间
      * 4. 插入订单主表
      * 5. 拆分并批量插入任务明细表（一份菜品 = 一条明细）
-     * 6. 触发器自动计算total_weight
+     * 6. 计算total_weight
      * 7. 返回订单详情
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public OrderDetailVO createOrder(CreateOrderDTO createOrderDTO) {
         //1.验证桌位是否存在
-        Table table=tableMapper.selectById(createOrderDTO.getTableId());
-        if (table==null) {
+        Table table = tableMapper.selectById(createOrderDTO.getTableId());
+        if (table == null) {
             throw new BusinessException("请先选择桌位再点菜");
         }
         //2.验证菜品的可用性
         //获取用户点菜单中的所有菜品id，用于后续的验证可用性
-        List<Long> dishIds=createOrderDTO.getItems().stream()
+        List<Long> dishIds = createOrderDTO.getItems().stream()
                 .map(OrderItemDTO::getDishId)
                 .distinct()
                 .toList();
@@ -76,95 +74,113 @@ public class OrderServiceImpl implements OrderService {
         Map<Long, Dish> dishMap = dishList.stream()
                 .collect(Collectors.toMap(Dish::getId, dish -> dish));
         //3.验证所有菜品是否存在，并计算总价和总时间
-        BigDecimal totalPrice=BigDecimal.ZERO;
+        BigDecimal totalPrice = BigDecimal.ZERO;
         Integer maxCookTime = 0;
-        for(OrderItemDTO itemDTO:createOrderDTO.getItems()) {
-            Dish dish=dishMap.get(itemDTO.getDishId());
-            if(dish==null) {
-                throw new BusinessException("这个菜品我们还没有学会制作：dishId"+itemDTO.getDishId());
-            }
-            //检查菜品可用性
-            Boolean isAvailable = dishMapper.checkDishAvailable(dish.getId());
-            if(!isAvailable) {
-                throw new BusinessException("不好意思，该菜品暂时不可以点单"+dish.getName());
-            }
-            //如果是限时菜品，执行redis的库存扣减
-            if(dish.getAttributeCode()==1){
-                String stockKey = "dish:stock:"+dish.getId();
-                //准备Lua脚本参数
-                Long now = System.currentTimeMillis()/1000;//
-                Long expireTime= 0L;
-                if(dish.getExpireTime()!=null) {
-                    expireTime = dish.getExpireTime()
-                            .atZone(ZoneId.systemDefault())//设置时区，中国时区
-                            .toInstant()//转换为计算机通用时间格式
-                            .getEpochSecond();//转换成秒数，以便和now比较
+        //创建一个用来存放redis扣减的item项目的list，如果需要回滚，可以按照扣减成功的回滚
+        List<OrderItemDTO> orderItemList = new ArrayList<>();
+        //使用try-catch来补偿redis
+        try {
+            for (OrderItemDTO itemDTO : createOrderDTO.getItems()) {
+                Dish dish = dishMap.get(itemDTO.getDishId());
+                if (dish == null) {
+                    throw new BusinessException("这个菜品我们还没有学会制作：dishId" + itemDTO.getDishId());
                 }
-                //执行Lua脚本
-                Long result =stringRedisTemplate.execute(
-                        stockDeductScript,
-                        Collections.singletonList(stockKey),//KEY[1]
-                        String.valueOf(itemDTO.getQuantity()),//ARGV[1]
-                        String.valueOf(now),//ARGV[2]
-                        String.valueOf(expireTime)//ARGV[3]
-                );
-                //根据返回值判断扣减结果
-                if(result == null) {
-                    throw new BusinessException("系统异常，Redis扣减失败");
-                }else if(result==-3) {
-                    throw new BusinessException("该限时菜品已经过期："+dish.getName());
-                }else if(result==-1) {
-                    throw new BusinessException("Redis中没有该菜品的库存，请联系管理员");
-                }else if(result==0) {
-                    throw new BusinessException("抱歉，【"+dish.getName()+"】库存不足");
+                //检查菜品可用性
+                Boolean isAvailable = dishMapper.checkDishAvailable(dish.getId());
+                if (!isAvailable) {
+                    throw new BusinessException("不好意思，该菜品暂时不可以点单" + dish.getName());
                 }
-                log.info("扣减成功");
+                //如果是限时菜品，执行redis的库存扣减
+                if (dish.getAttributeCode() == 1) {
+                    String stockKey = "dish:stock:" + dish.getId();
+                    //准备Lua脚本参数
+                    Long now = System.currentTimeMillis() / 1000;//
+                    Long expireTime = 0L;
+                    if (dish.getExpireTime() != null) {
+                        expireTime = dish.getExpireTime()
+                                .atZone(ZoneId.systemDefault())//设置时区，中国时区
+                                .toInstant()//转换为计算机通用时间格式
+                                .getEpochSecond();//转换成秒数，以便和now比较
+                    }
+                    //执行Lua脚本
+                    Long result = stringRedisTemplate.execute(
+                            stockDeductScript,
+                            Collections.singletonList(stockKey),//KEY[1]
+                            String.valueOf(itemDTO.getQuantity()),//ARGV[1]
+                            String.valueOf(now),//ARGV[2]
+                            String.valueOf(expireTime)//ARGV[3]
+                    );
+                    //根据返回值判断扣减结果
+                    if (result == null) {
+                        throw new BusinessException("系统异常，Redis扣减失败");
+                    } else if (result == -3) {
+                        throw new BusinessException("该限时菜品已经过期：" + dish.getName());
+                    } else if (result == -1) {
+                        throw new BusinessException("Redis中没有该菜品的库存，请联系管理员");
+                    } else if (result == 0) {
+                        throw new BusinessException("抱歉，【" + dish.getName() + "】库存不足");
+                    }
+                    //新增itemDTO,也就是扣减的item项
+                    orderItemList.add(itemDTO);
+                    log.info("扣减成功");
+                }
+                //累加总价
+                BigDecimal itemTotal = dish.getPrice().multiply(new BigDecimal(itemDTO.getQuantity()));
+                totalPrice = totalPrice.add(itemTotal);
+                //更新最大制作时间
+                if (dish.getCookTime() > maxCookTime) {
+                    maxCookTime = dish.getCookTime();
+                }
             }
-            //累加总价
-            BigDecimal itemTotal= dish.getPrice().multiply(new BigDecimal(itemDTO.getQuantity()));
-            totalPrice=totalPrice.add(itemTotal);
-            //更新最大制作时间
-            if(dish.getCookTime()>maxCookTime) {
-                maxCookTime=dish.getCookTime();
+            //计算总重量
+            int totalWeight = dishList.stream().filter(dish1 -> dish1.getEstWeight() != null)
+                    .mapToInt(Dish::getEstWeight).sum();
+            log.info("订单总价：{}，订单总时间：{}", totalPrice, maxCookTime);
+            //插入订单主表+总重量这里触发器直接自己计算了，不用再插入
+            Order order = Order.builder()
+                    .userId(UserContext.getCurrentUserId())
+                    .tableId(createOrderDTO.getTableId())
+                    .totalCookTime(maxCookTime)
+                    .totalWeight(totalWeight)
+                    .totalPrice(totalPrice)
+                    .actualAmount(totalPrice)
+                    .orderStatus(0)
+                    .payStatus(0)
+                    .remarks(createOrderDTO.getRemarks())
+                    .build();
+            orderMapper.insert(order);
+            log.info("订单创建成功");
+            //5.拆分并批量插入任务明细表中
+            List<OrderItem> orderItems = new ArrayList<>();
+            for (OrderItemDTO itemDTO : createOrderDTO.getItems()) {
+                //每个菜品按照数量拆分成多个明细
+                for (int i = 0; i < itemDTO.getQuantity(); i++) {
+                    OrderItem orderItem = OrderItem.builder()
+                            .orderId(order.getId())
+                            .dishId(itemDTO.getDishId())
+                            .itemStatus(0)
+                            .isPriority(0).build();
+                    orderItems.add(orderItem);
+                }
             }
+            //批量插入所有明细，提高性能
+            orderItemMapper.insertBatchSomeColumn(orderItems);
+            // ========== 新增：发 MQ 消息通知后厨 ==========
+            sendMQ(order, table, orderItems, dishMap);
+            //返回订单详情
+            return getOrderDetailVO(order.getId());
+        } catch (Exception e) {
+            log.info("事务出现异常，开始回滚redis库存");
+            //使用扣减的item项来回补redis
+            for(OrderItemDTO item: orderItemList) {
+                try {
+                    stringRedisTemplate.opsForValue().increment("dish:stock:" + item.getDishId(), item.getQuantity());
+                }catch (Exception ex){
+                        log.error("redis回滚异常，请及时处理:dish={}",item.getDishId());}
+            }
+            //重新抛出异常，否则以为处理了异常，事务就会成功
+            throw e;
         }
-        //计算总重量
-        int totalWeight = dishList.stream().filter(dish1 -> dish1.getEstWeight() != null)
-                .mapToInt(Dish::getEstWeight).sum();
-        log.info("订单总价：{}，订单总时间：{}",totalPrice,maxCookTime);
-        //插入订单主表+总重量这里触发器直接自己计算了，不用再插入
-        Order order= Order.builder()
-                .userId(UserContext.getCurrentUserId())
-                .tableId(createOrderDTO.getTableId())
-                .totalCookTime(maxCookTime)
-                .totalWeight(totalWeight)
-                .totalPrice(totalPrice)
-                .actualAmount(totalPrice)
-                .orderStatus(0)
-                .payStatus(0)
-                .remarks(createOrderDTO.getRemarks())
-                .build();
-        orderMapper.insert(order);
-        log.info("订单创建成功");
-        //5.拆分并批量插入任务明细表中
-        List<OrderItem> orderItems = new ArrayList<>();
-        for(OrderItemDTO itemDTO:createOrderDTO.getItems()) {
-            //每个菜品按照数量拆分成多个明细
-            for(int i=0;i<itemDTO.getQuantity();i++) {
-                OrderItem orderItem = OrderItem.builder()
-                        .orderId(order.getId())
-                        .dishId(itemDTO.getDishId())
-                        .itemStatus(0)
-                        .isPriority(0).build();
-                orderItems.add(orderItem);
-            }
-        }
-        //批量插入所有明细，提高性能
-        orderItemMapper.insertBatchSomeColumn(orderItems);
-        // ========== 新增：发 MQ 消息通知后厨 ==========
-        sendMQ(order,table,orderItems,dishMap);
-        //返回订单详情
-        return getOrderDetailVO(order.getId());
     }
     //将MQ从主流程中剥离出来，以便对主流程进行瘦身
     private void sendMQ(Order order,Table table,List<OrderItem> orderItems,Map<Long,Dish> dishMap) {
@@ -191,8 +207,6 @@ public class OrderServiceImpl implements OrderService {
                     .remarks(order.getRemarks()).build();
             //使用本地事务发布消息
             applicationEventPublisher.publishEvent(notifyMessage);
-            //将消息发入队列
-            //mqProducer.sendKitchenNotify(notifyMessage);
             log.info("订单消息监听器发送消息成功：messageId={}",notifyMessage.getOrderId());
         }catch (Exception e) {
             log.info("后厨发送失败");
